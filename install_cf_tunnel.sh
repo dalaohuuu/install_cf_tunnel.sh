@@ -17,6 +17,14 @@ PANEL_HOST="$1"          # 面板域名（Cloudflare Tunnel 入口）
 PANEL_LOCAL_PORT="$2"    # 3x-ui 本地面板端口（例如 9999）
 TUNNEL_NAME="${3:-${HOSTNAME}-panel}"   # Tunnel 名默认值：主机名 + "-panel"
 
+# 固定订阅本地端口
+SUB_LOCAL_PORT=2096
+
+# 根据面板域名自动推导订阅域名：sub.<根域名>
+# 例如 paneldmit.6568888.xyz -> sub.6568888.xyz
+ROOT_DOMAIN="${PANEL_HOST#*.}"
+SUB_HOST="sub.${ROOT_DOMAIN}"
+
 # 检查第 1 参数：面板域名
 if [ -z "$PANEL_HOST" ]; then
   echo "错误：你必须输入面板域名。"
@@ -34,10 +42,13 @@ if [ -z "$PANEL_LOCAL_PORT" ]; then
 fi
 
 echo "==============================================="
-echo " 面板域名      : $PANEL_HOST"
-echo " 本地面板端口  : $PANEL_LOCAL_PORT"
-echo " Tunnel 名称   : $TUNNEL_NAME"
-echo " 主机名        : $HOSTNAME"
+echo " 面板域名        : $PANEL_HOST"
+echo " 本地面板端口    : $PANEL_LOCAL_PORT"
+echo " 订阅域名        : $SUB_HOST"
+echo " 本地订阅端口    : $SUB_LOCAL_PORT"
+echo " Tunnel 名称     : $TUNNEL_NAME"
+echo " 主机名          : $HOSTNAME"
+echo " 根域名推导结果  : $ROOT_DOMAIN"
 echo "==============================================="
 echo
 
@@ -139,9 +150,15 @@ tunnel: $TUNNEL_ID
 credentials-file: $CRED_FILE
 
 ingress:
+  # 面板入口，通过 $PANEL_HOST 访问本地 $PANEL_LOCAL_PORT
   - hostname: $PANEL_HOST
     service: http://localhost:$PANEL_LOCAL_PORT
 
+  # 订阅入口，通过 $SUB_HOST 访问本地订阅端口 $SUB_LOCAL_PORT
+  - hostname: $SUB_HOST
+    service: http://localhost:$SUB_LOCAL_PORT
+
+  # 兜底规则，未匹配的请求全部返回 404
   - service: http_status:404
 EOF
 
@@ -155,11 +172,16 @@ echo
 #############################################
 
 echo "== 步骤 3 / 4：为 $PANEL_HOST 创建 DNS 记录并绑定 Tunnel =="
-
 cloudflared tunnel route dns "$TUNNEL_NAME" "$PANEL_HOST"
 
 echo
-echo "DNS 记录创建完成。"
+echo "== 步骤 3 / 4（续）：为 $SUB_HOST 创建 DNS 记录并绑定 Tunnel =="
+cloudflared tunnel route dns "$TUNNEL_NAME" "$SUB_HOST"
+
+echo
+echo "DNS 记录创建完成："
+echo "  面板域名   : $PANEL_HOST"
+echo "  订阅域名   : $SUB_HOST"
 echo
 
 #############################################
@@ -172,7 +194,7 @@ SERVICE_FILE="/etc/systemd/system/cloudflared.service"
 
 cat > "$SERVICE_FILE" <<EOF
 [Unit]
-Description=Cloudflare Tunnel for 3x-ui panel
+Description=Cloudflare Tunnel for 3x-ui panel & subscription
 After=network-online.target
 
 [Service]
@@ -198,11 +220,12 @@ echo
 echo "=========================================="
 echo "  完 成 ！"
 echo "=========================================="
-echo "现在你可以通过以下地址访问面板："
-echo "  https://$PANEL_HOST"
+echo "现在你可以通过以下地址访问："
+echo "  面板： https://$PANEL_HOST"
+echo "  订阅： https://$SUB_HOST  （对应本地端口 $SUB_LOCAL_PORT）"
 echo
 echo "建议："
-echo "  1. 使用防火墙屏蔽外网访问本地端口 $PANEL_LOCAL_PORT"
+echo "  1. 使用防火墙屏蔽外网直接访问本地端口 $PANEL_LOCAL_PORT 和 $SUB_LOCAL_PORT"
 echo "  2. Reality 业务域名保持灰色云（DNS Only），确保直连"
 echo
 echo "查看日志： journalctl -u cloudflared -f"
