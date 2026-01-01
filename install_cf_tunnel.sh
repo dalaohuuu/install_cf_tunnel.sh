@@ -21,9 +21,7 @@ CERT_FILE="${CLOUDFLARED_DIR}/cert.pem"
 log() { echo -e "$*"; }
 die() { echo -e "❌ $*" >&2; exit 1; }
 
-has_tty() {
-  [ -t 0 ] && [ -t 1 ]
-}
+has_tty() { [ -t 0 ] && [ -t 1 ]; }
 
 need_root() {
   if [ "${EUID}" -ne 0 ]; then
@@ -37,20 +35,17 @@ arch_tag() {
   case "$m" in
     x86_64|amd64) echo "amd64" ;;
     aarch64|arm64) echo "arm64" ;;
-    *)
-      die "不支持的架构：${m}（目前脚本仅支持 amd64/arm64）"
-      ;;
+    *) die "不支持的架构：${m}（目前仅支持 amd64/arm64）" ;;
   esac
 }
 
 download_cloudflared_bin() {
-  local arch
+  local arch url
   arch="$(arch_tag)"
   log "安装 cloudflared（单文件二进制，${arch}）..."
 
   mkdir -p "$(dirname "${CLOUDFLARED_BIN}")"
 
-  local url
   if [ "${arch}" = "amd64" ]; then
     url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
   else
@@ -62,14 +57,12 @@ download_cloudflared_bin() {
 }
 
 install_cloudflared_deb() {
+  local arch url
   log "安装 cloudflared（.deb 包）..."
   apt update
   apt install -y wget
 
-  local arch
   arch="$(arch_tag)"
-
-  local url
   if [ "${arch}" = "amd64" ]; then
     url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb"
   else
@@ -150,14 +143,12 @@ deny_public_port() {
 
   log "🔐 尝试封死公网对 ${port}/tcp 的访问（双保险，防绕过）..."
 
-  # UFW 优先
   if command -v ufw >/dev/null 2>&1; then
     ufw deny "${port}/tcp" >/dev/null 2>&1 || true
-    log "已通过 ufw 设置 deny ${port}/tcp（若 ufw 未启用不会生效）"
+    log "已通过 ufw 设置 deny ${port}/tcp（若 ufw 未启用可能不生效）"
     return
   fi
 
-  # 其次用 iptables（不保证重启后持久）
   if command -v iptables >/dev/null 2>&1; then
     iptables -I INPUT -p tcp --dport "${port}" -j DROP || true
     log "已通过 iptables 插入 DROP 规则（注意：重启后可能失效，需自行持久化）"
@@ -226,10 +217,108 @@ update_cloudflared() {
   exit 0
 }
 
+status_check() {
+  log "==================== Cloudflare Tunnel Status ===================="
+  log "时间：$(date)"
+  log "cloudflared：$(command -v cloudflared 2>/dev/null || echo '未安装')"
+  (cloudflared --version 2>/dev/null || true)
+  log
+
+  log "[1] systemd 服务：${SERVICE_NAME}"
+  if systemctl list-unit-files | grep -q "^${SERVICE_NAME}\.service"; then
+    systemctl is-active "${SERVICE_NAME}" >/dev/null 2>&1 && log "✅ Active: running" || log "❌ Active: NOT running"
+    systemctl --no-pager --full status "${SERVICE_NAME}" | sed -n '1,12p' || true
+  else
+    log "❌ 未发现 systemd 服务：${SERVICE_NAME}.service"
+  fi
+  log
+
+  log "[2] 配置/证书/凭证目录：${CLOUDFLARED_DIR}"
+  if [ -d "${CLOUDFLARED_DIR}" ]; then
+    ls -l "${CLOUDFLARED_DIR}" || true
+  else
+    log "❌ 目录不存在：${CLOUDFLARED_DIR}"
+  fi
+  [ -f "${CONFIG_FILE}" ] && log "✅ config.yml 存在：${CONFIG_FILE}" || log "❌ config.yml 不存在：${CONFIG_FILE}"
+  [ -f "${CERT_FILE}" ] && log "✅ cert.pem 存在：${CERT_FILE}" || log "❌ cert.pem 不存在：${CERT_FILE}"
+  log
+
+  log "[3] Tunnel 列表（需要已登录）"
+  if [ -f "${CERT_FILE}" ] && command -v cloudflared >/dev/null 2>&1; then
+    cloudflared tunnel list 2>/dev/null || log "⚠️  无法列出 tunnel（可能网络/权限问题）"
+  else
+    log "⚠️  未登录或未安装 cloudflared，跳过 tunnel list"
+  fi
+  log
+
+  log "[4] Ingress（从 config.yml 提取）"
+  HOST_IN_CFG=""
+  SVC_IN_CFG=""
+  if [ -f "${CONFIG_FILE}" ]; then
+    log "---- config.yml 摘要 ----"
+    sed -n '1,120p' "${CONFIG_FILE}" | sed -n '1,80p'
+    log "------------------------"
+    HOST_IN_CFG="$(awk '/hostname:/{print $2; exit}' "${CONFIG_FILE}" 2>/dev/null || true)"
+    SVC_IN_CFG="$(awk '/service:/{print $2; exit}' "${CONFIG_FILE}" 2>/dev/null || true)"
+    [ -n "${HOST_IN_CFG:-}" ] && log "解析到 hostname：${HOST_IN_CFG}"
+    [ -n "${SVC_IN_CFG:-}" ] && log "解析到 service ：${SVC_IN_CFG}"
+  else
+    log "⚠️  未找到 config.yml，无法解析 ingress"
+  fi
+  log
+
+  log "[5] 本地服务连通性（如果能解析到 service）"
+  if [ -n "${SVC_IN_CFG:-}" ] && echo "${SVC_IN_CFG}" | grep -qE '^http://'; then
+    PORT_IN_CFG="$(echo "${SVC_IN_CFG}" | sed -n 's#.*:\([0-9]\+\).*#\1#p')"
+    if [ -n "${PORT_IN_CFG:-}" ]; then
+      if ss -lntp 2>/dev/null | grep -q ":${PORT_IN_CFG} "; then
+        log "✅ 端口监听：${PORT_IN_CFG}"
+        ss -lntp | grep ":${PORT_IN_CFG} " || true
+      else
+        log "❌ 端口未监听：${PORT_IN_CFG}"
+      fi
+      curl -I --max-time 3 "${SVC_IN_CFG}" >/dev/null 2>&1 && log "✅ 本地 curl OK：${SVC_IN_CFG}" || log "❌ 本地 curl 失败：${SVC_IN_CFG}"
+    else
+      log "⚠️  无法从 service 解析端口：${SVC_IN_CFG}"
+    fi
+  else
+    log "⚠️  未解析到 service URL，跳过本地连通性检查"
+  fi
+  log
+
+  log "[6] 外网访问（如果能解析到 hostname）"
+  if [ -n "${HOST_IN_CFG:-}" ]; then
+    if command -v dig >/dev/null 2>&1; then
+      DNS_A="$(dig +short "${HOST_IN_CFG}" | head -n 1 || true)"
+      log "DNS 解析：${DNS_A:-<空>}"
+      echo "${DNS_A:-}" | grep -qi "cfargotunnel" && log "✅ DNS 指向 cfargotunnel（像是 tunnel）" || log "⚠️  DNS 看起来不像 cfargotunnel（不一定错，但建议检查）"
+    else
+      log "提示：未安装 dig，跳过 DNS 检查（可 sudo apt install dnsutils）"
+    fi
+
+    curl -I --max-time 6 "https://${HOST_IN_CFG}" >/dev/null 2>&1 \
+      && log "✅ HTTPS 访问 OK：https://${HOST_IN_CFG}" \
+      || log "❌ HTTPS 访问失败：https://${HOST_IN_CFG}（可能 DNS/证书/服务端口/应用问题）"
+  else
+    log "⚠️  未解析到 hostname，跳过外网访问检查"
+  fi
+
+  log "============================== Done =============================="
+  exit 0
+}
+
+follow_logs() {
+  log "跟踪日志：journalctl -u ${SERVICE_NAME} -f"
+  journalctl -u "${SERVICE_NAME}" -f
+  exit 0
+}
+
 usage() {
   cat <<EOF
 用法：
   部署：$0 <域名> <本地端口> [Tunnel名]
+  状态：$0 --status
+  日志：$0 --logs
   卸载：$0 --uninstall
   更新：$0 --update
 
@@ -250,6 +339,8 @@ if [ $# -ge 1 ]; then
     -h|--help) usage; exit 0 ;;
     --uninstall) uninstall_all ;;
     --update) update_cloudflared ;;
+    --status) status_check ;;
+    --logs) follow_logs ;;
   esac
 fi
 
