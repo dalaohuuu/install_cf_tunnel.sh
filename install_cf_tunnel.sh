@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ============= 可调默认值 =============
-: "${INSTALL_MODE:=bin}"   # bin | deb
+: "${INSTALL_MODE:=bin}"              # bin | deb
 : "${CLOUDFLARED_BIN:=/usr/local/bin/cloudflared}"
-# ===================================
 
 if [ "${EUID}" -ne 0 ]; then
   echo "请使用 root 或 sudo 运行。"
@@ -59,14 +57,10 @@ ensure_cloudflared() {
     echo "检测到 cloudflared：$(command -v cloudflared)"
     return
   fi
-
   case "${INSTALL_MODE}" in
     bin) install_cloudflared_bin ;;
     deb) install_cloudflared_deb ;;
-    *)
-      echo "INSTALL_MODE 必须是 bin 或 deb"
-      exit 1
-      ;;
+    *) echo "INSTALL_MODE 必须是 bin 或 deb" ; exit 1 ;;
   esac
 }
 
