@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
 #############################################
-# 参数解析（必须输入前 3 个参数）
+# 参数解析（必须输入前 2 个参数）
 #############################################
 
 if [ "$EUID" -ne 0 ]; then
@@ -10,36 +10,34 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
-# 自动获取主机名用于 Tunnel 默认名
-HOSTNAME=$(hostname)
+HOSTNAME_SYS=$(hostname)
 
-PANEL_HOST="$1"        # 运行时指定：面板域名
-PANEL_LOCAL_PORT="$2"  # 本地面板端口（如 9999）
-SUB_HOST="$3"          # 运行时指定：订阅域名
-TUNNEL_NAME="${4:-${HOSTNAME}-panel}"   # Tunnel 名（可选）
-
-SUB_LOCAL_PORT=2096    # 固定订阅本地端口
+PUBLIC_HOST="$1"        # 运行时指定：对外访问域名（子域名/根域名均可）
+LOCAL_PORT="$2"         # 本地服务端口（如 8000）
+TUNNEL_NAME="${3:-${HOSTNAME_SYS}-web}"   # Tunnel 名（可选）
+LOCAL_HOST="127.0.0.1"
+SERVICE_URL="http://${LOCAL_HOST}:${LOCAL_PORT}"
 
 # 参数检查
-if [ -z "$PANEL_HOST" ] || [ -z "$PANEL_LOCAL_PORT" ] || [ -z "$SUB_HOST" ]; then
+if [ -z "${PUBLIC_HOST:-}" ] || [ -z "${LOCAL_PORT:-}" ]; then
   echo "错误：参数不足。"
-  echo "用法：$0 <面板域名> <本地端口> <订阅域名> [Tunnel 名]"
-  echo "示例：$0 paneldmit.6568888.xyz 9999 subdmit.6568888.xyz"
+  echo "用法：$0 <域名> <本地端口> [Tunnel 名]"
+  echo "示例：$0 app.example.com 8000"
   exit 1
 fi
 
 echo "==============================================="
-echo " 面板域名        : $PANEL_HOST"
-echo " 本地面板端口    : $PANEL_LOCAL_PORT"
-echo " 订阅域名        : $SUB_HOST"
-echo " 本地订阅端口    : $SUB_LOCAL_PORT"
+echo " 域名            : $PUBLIC_HOST"
+echo " 本地服务        : $SERVICE_URL"
 echo " Tunnel 名称     : $TUNNEL_NAME"
-echo " 主机名          : $HOSTNAME"
+echo " 主机名          : $HOSTNAME_SYS"
 echo "==============================================="
 echo
 
 #############################################
 # 安装 cloudflared（如未安装）
+# 说明：你现在已经用二进制安装过了，此段依旧兼容；
+# 若未安装，则用 .deb 安装（Debian/Ubuntu）
 #############################################
 
 if ! command -v cloudflared >/dev/null 2>&1; then
@@ -60,7 +58,19 @@ echo "cloudflared 版本：$(cloudflared --version || echo '未知')"
 echo
 
 #############################################
-# Cloudflare 登录
+# 检查本地端口是否监听（仅提醒，不阻断）
+#############################################
+
+echo "== 检查本地端口监听：$LOCAL_PORT =="
+if ss -lntp 2>/dev/null | grep -q ":${LOCAL_PORT} "; then
+  ss -lntp | grep ":${LOCAL_PORT} " || true
+else
+  echo "警告：未检测到 ${LOCAL_PORT} 端口监听。请确认你的服务已启动。"
+fi
+echo
+
+#############################################
+# Cloudflare 登录（需要浏览器授权）
 #############################################
 
 echo "======================================================"
@@ -68,29 +78,28 @@ echo " 现在必须完成 Cloudflare 登录授权，否则 Tunnel 无法创建"
 echo " 稍后终端会输出一个 URL，请复制到浏览器手动登录一次"
 echo "======================================================"
 echo
-read -p "按回车执行 cloudflared tunnel login..." _
+read -r -p "按回车执行 cloudflared tunnel login..." _
 
 cloudflared tunnel login || true
 
 #############################################
-# 创建 Tunnel
+# 创建/复用 Tunnel
 #############################################
 
 echo
-echo "== 创建 Tunnel：$TUNNEL_NAME =="
+echo "== 创建/复用 Tunnel：$TUNNEL_NAME =="
 
-CREATE_OUT=$(cloudflared tunnel create "$TUNNEL_NAME" 2>&1 | tee /tmp/cloudflared_create.log || true)
-
-# 解析 Tunnel ID
-TUNNEL_ID=$(echo "$CREATE_OUT" | grep -oE 'ID:\s*[0-9a-f-]+' | awk '{print $2}' | head -n1)
-
-if [ -z "$TUNNEL_ID" ]; then
-  LIST_OUT=$(cloudflared tunnel list 2>/dev/null || true)
-  TUNNEL_ID=$(echo "$LIST_OUT" | grep "$TUNNEL_NAME" | awk '{print $1}' | head -n1)
+if cloudflared tunnel list 2>/dev/null | awk '{print $2}' | grep -Fxq "$TUNNEL_NAME"; then
+  echo "Tunnel 已存在，复用：$TUNNEL_NAME"
+else
+  cloudflared tunnel create "$TUNNEL_NAME"
 fi
 
-if [ -z "$TUNNEL_ID" ]; then
-  echo "错误：无法获取 Tunnel ID"
+# 获取 Tunnel ID（更稳：直接从 list 里取）
+TUNNEL_ID="$(cloudflared tunnel list | awk -v n="$TUNNEL_NAME" '$2==n{print $1; exit}')"
+
+if [ -z "${TUNNEL_ID:-}" ]; then
+  echo "错误：无法获取 Tunnel ID（cloudflared tunnel list 未找到 $TUNNEL_NAME）"
   exit 1
 fi
 
@@ -112,16 +121,11 @@ tunnel: $TUNNEL_ID
 credentials-file: $CRED_FILE
 
 ingress:
-  - hostname: $PANEL_HOST
-    service: http://localhost:$PANEL_LOCAL_PORT
-
-  - hostname: $SUB_HOST
-    service: http://localhost:$SUB_LOCAL_PORT
-
+  - hostname: $PUBLIC_HOST
+    service: $SERVICE_URL
   - service: http_status:404
 EOF
 
-echo
 echo "已生成配置文件：$CONFIG_FILE"
 cat "$CONFIG_FILE"
 echo
@@ -130,12 +134,9 @@ echo
 # 绑定 DNS
 #############################################
 
-echo "== 绑定 DNS：$PANEL_HOST =="
-cloudflared tunnel route dns "$TUNNEL_NAME" "$PANEL_HOST"
-
+echo "== 绑定 DNS：$PUBLIC_HOST =="
+cloudflared tunnel route dns "$TUNNEL_NAME" "$PUBLIC_HOST"
 echo
-echo "== 绑定 DNS：$SUB_HOST =="
-cloudflared tunnel route dns "$TUNNEL_NAME" "$SUB_HOST"
 
 #############################################
 # systemd 服务
@@ -145,7 +146,7 @@ SERVICE_FILE="/etc/systemd/system/cloudflared.service"
 
 cat > "$SERVICE_FILE" <<EOF
 [Unit]
-Description=Cloudflare Tunnel for panel & subscription
+Description=Cloudflare Tunnel for ${PUBLIC_HOST}
 After=network-online.target
 
 [Service]
@@ -167,6 +168,7 @@ echo
 echo "=========================================="
 echo "  完 成 ！"
 echo "=========================================="
-echo "面板访问地址： https://$PANEL_HOST"
-echo "订阅访问地址： https://$SUB_HOST"
+echo "访问地址： https://$PUBLIC_HOST"
+echo "查看状态： systemctl status cloudflared --no-pager"
+echo "查看日志： journalctl -u cloudflared -f"
 echo "=========================================="
