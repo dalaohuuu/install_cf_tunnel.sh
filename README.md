@@ -5,5 +5,5 @@
 ## 用法
 
 ```
-curl -fsSL https://raw.githubusercontent.com/<you>/<repo>/main/tunnel-one.sh | sudo bash -s -- app.example.com 8000
+curl -fsSL https://raw.githubusercontent.com/dalaohuuu/install_cf_tunnel.sh/refs/heads/main/install_cf_tunnel.sh | sudo bash -s -- app.example.com 8000
 ```
