@@ -126,6 +126,7 @@ cloudflared tunnel list
 ```
 ss -lntp | grep :8000
 ```
+```
 curl -I http://127.0.0.1:8000
 ```
 ```
