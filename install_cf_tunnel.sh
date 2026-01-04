@@ -8,19 +8,23 @@ set -euo pipefail
 : "${CLOUDFLARED_BIN:=/usr/local/bin/cloudflared}"
 : "${CLOUDFLARED_DIR:=/root/.cloudflared}"
 : "${SERVICE_NAME:=cloudflared}"
+
 : "${STRICT_PORT:=0}"                    # 1=端口不监听则退出；0=仅警告
-: "${DENY_PUBLIC_PORT:=0}"               # 1=尝试封死公网对端口访问（ufw优先，其次iptables）；0=不改防火墙
+: "${DENY_PUBLIC_PORT:=0}"               # 1=尝试封死公网端口访问；0=不改防火墙
+
+: "${RECREATE_ON_MISSING_CRED:=1}"       # 1=若 tunnel 存在但缺 json，则自动删除并重建（推荐）；0=直接报错退出
+
+# 3x-ui / HTTPS 场景可覆盖
+: "${BACKEND_SCHEME:=http}"              # http | https
+: "${NO_TLS_VERIFY:=0}"                  # 1=对后端 https 跳过证书校验（3x-ui 常用）
+: "${PATH_REGEX:=}"                      # 例如：^/xxxx(/|$).*   （需要子路径匹配时再设）
 
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 CONFIG_FILE="${CLOUDFLARED_DIR}/config.yml"
 CERT_FILE="${CLOUDFLARED_DIR}/cert.pem"
 
-# =======================
-# 工具函数
-# =======================
 log() { echo -e "$*"; }
 die() { echo -e "❌ $*" >&2; exit 1; }
-
 has_tty() { [ -t 0 ] && [ -t 1 ]; }
 
 need_root() {
@@ -52,6 +56,7 @@ download_cloudflared_bin() {
     url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64"
   fi
 
+  command -v curl >/dev/null 2>&1 || apt update && apt install -y curl >/dev/null 2>&1 || true
   curl -L --fail -o "${CLOUDFLARED_BIN}" "${url}"
   chmod +x "${CLOUDFLARED_BIN}"
 }
@@ -88,42 +93,36 @@ ensure_cloudflared() {
 }
 
 require_login_or_exit() {
+  mkdir -p "${CLOUDFLARED_DIR}"
+  chmod 700 "${CLOUDFLARED_DIR}"
+
   if [ -f "${CERT_FILE}" ]; then
     log "✅ 已检测到授权证书：${CERT_FILE}（跳过登录）"
     return
   fi
 
   log "❌ 未检测到授权证书：${CERT_FILE}"
-  log "Cloudflare Tunnel 第一次必须手动浏览器授权一次。请先执行："
-  log ""
+  log "首次使用 Cloudflare Tunnel 需要浏览器授权。请执行："
   log "  sudo cloudflared tunnel login"
-  log ""
+  log
 
   if has_tty; then
-    read -r -p "按回车现在开始执行 cloudflared tunnel login..." _
+    read -r -p "按回车开始执行 cloudflared tunnel login..." _
     cloudflared tunnel login || true
-    if [ ! -f "${CERT_FILE}" ]; then
-      die "登录后仍未生成 ${CERT_FILE}，请确认你在浏览器里已完成授权，并重新运行脚本。"
-    fi
+    [ -f "${CERT_FILE}" ] || die "登录后仍未生成 ${CERT_FILE}，请确认浏览器授权已完成。"
   else
-    log "检测到当前为非交互环境（例如 curl|bash）。为避免卡住/失败，脚本退出。"
-    log "完成上述登录后，再重新运行本脚本即可。"
-    exit 1
+    die "当前为非交互环境（例如 curl|bash），无法完成浏览器授权。请手动 cloudflared tunnel login 后再运行。"
   fi
 }
 
-ensure_tunnel() {
+tunnel_exists() {
   local tunnel_name="$1"
-  if cloudflared tunnel list 2>/dev/null | awk '{print $2}' | grep -Fxq "${tunnel_name}"; then
-    log "Tunnel 已存在，复用：${tunnel_name}"
-  else
-    cloudflared tunnel create "${tunnel_name}"
-  fi
+  cloudflared tunnel list 2>/dev/null | awk '{print $2}' | grep -Fxq "${tunnel_name}"
 }
 
 get_tunnel_id() {
   local tunnel_name="$1"
-  cloudflared tunnel list | awk -v n="${tunnel_name}" '$2==n{print $1; exit}'
+  cloudflared tunnel list 2>/dev/null | awk -v n="${tunnel_name}" '$2==n{print $1; exit}'
 }
 
 check_port_listen() {
@@ -137,25 +136,59 @@ check_port_listen() {
 
 deny_public_port() {
   local port="$1"
-  if [ "${DENY_PUBLIC_PORT}" -ne 1 ]; then
-    return
-  fi
+  [ "${DENY_PUBLIC_PORT}" -eq 1 ] || return 0
 
-  log "🔐 尝试封死公网对 ${port}/tcp 的访问（双保险，防绕过）..."
+  log "🔐 尝试封死公网对 ${port}/tcp 的访问（防绕过）..."
 
   if command -v ufw >/dev/null 2>&1; then
     ufw deny "${port}/tcp" >/dev/null 2>&1 || true
-    log "已通过 ufw 设置 deny ${port}/tcp（若 ufw 未启用可能不生效）"
-    return
+    log "已通过 ufw deny ${port}/tcp（若 ufw 未启用可能不生效）"
+    return 0
   fi
 
   if command -v iptables >/dev/null 2>&1; then
     iptables -I INPUT -p tcp --dport "${port}" -j DROP || true
-    log "已通过 iptables 插入 DROP 规则（注意：重启后可能失效，需自行持久化）"
-    return
+    log "已通过 iptables 插入 DROP 规则（重启后可能失效，需自行持久化）"
+    return 0
   fi
 
   log "提示：系统无 ufw/iptables，跳过防火墙加固。"
+}
+
+write_config() {
+  local public_host="$1"
+  local service_url="$2"
+  local tunnel_id="$3"
+  local cred_file="$4"
+
+  cat > "${CONFIG_FILE}" <<EOF
+tunnel: ${tunnel_id}
+credentials-file: ${cred_file}
+
+ingress:
+  - hostname: ${public_host}
+EOF
+
+  if [ -n "${PATH_REGEX}" ]; then
+    cat >> "${CONFIG_FILE}" <<EOF
+    path: ${PATH_REGEX}
+EOF
+  fi
+
+  cat >> "${CONFIG_FILE}" <<EOF
+    service: ${service_url}
+EOF
+
+  if [ "${BACKEND_SCHEME}" = "https" ] && [ "${NO_TLS_VERIFY}" -eq 1 ]; then
+    cat >> "${CONFIG_FILE}" <<'EOF'
+    originRequest:
+      noTLSVerify: true
+EOF
+  fi
+
+  cat >> "${CONFIG_FILE}" <<'EOF'
+  - service: http_status:404
+EOF
 }
 
 install_service() {
@@ -166,11 +199,13 @@ install_service() {
 [Unit]
 Description=Cloudflare Tunnel (${tunnel_name})
 After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=$(command -v cloudflared) tunnel run ${tunnel_name}
+ExecStart=$(command -v cloudflared) --config ${CONFIG_FILE} tunnel run
 Restart=on-failure
+RestartSec=2
 User=root
 WorkingDirectory=${CLOUDFLARED_DIR}
 
@@ -179,7 +214,8 @@ WantedBy=multi-user.target
 EOF
 
   systemctl daemon-reload
-  systemctl enable --now "${SERVICE_NAME}" >/dev/null 2>&1 || true
+  systemctl enable "${SERVICE_NAME}" >/dev/null 2>&1 || true
+  systemctl reset-failed "${SERVICE_NAME}" >/dev/null 2>&1 || true
   systemctl restart "${SERVICE_NAME}"
 }
 
@@ -204,9 +240,8 @@ uninstall_all() {
 }
 
 update_cloudflared() {
-  local mode="${INSTALL_MODE}"
-  log "更新 cloudflared（模式：${mode}）..."
-  if [ "${mode}" = "deb" ]; then
+  log "更新 cloudflared（模式：${INSTALL_MODE}）..."
+  if [ "${INSTALL_MODE}" = "deb" ]; then
     apt update
     apt install -y cloudflared
   else
@@ -227,83 +262,15 @@ status_check() {
   log "[1] systemd 服务：${SERVICE_NAME}"
   if systemctl list-unit-files | grep -q "^${SERVICE_NAME}\.service"; then
     systemctl is-active "${SERVICE_NAME}" >/dev/null 2>&1 && log "✅ Active: running" || log "❌ Active: NOT running"
-    systemctl --no-pager --full status "${SERVICE_NAME}" | sed -n '1,12p' || true
+    systemctl --no-pager --full status "${SERVICE_NAME}" | sed -n '1,18p' || true
   else
     log "❌ 未发现 systemd 服务：${SERVICE_NAME}.service"
   fi
   log
 
-  log "[2] 配置/证书/凭证目录：${CLOUDFLARED_DIR}"
-  if [ -d "${CLOUDFLARED_DIR}" ]; then
-    ls -l "${CLOUDFLARED_DIR}" || true
-  else
-    log "❌ 目录不存在：${CLOUDFLARED_DIR}"
-  fi
-  [ -f "${CONFIG_FILE}" ] && log "✅ config.yml 存在：${CONFIG_FILE}" || log "❌ config.yml 不存在：${CONFIG_FILE}"
-  [ -f "${CERT_FILE}" ] && log "✅ cert.pem 存在：${CERT_FILE}" || log "❌ cert.pem 不存在：${CERT_FILE}"
-  log
-
-  log "[3] Tunnel 列表（需要已登录）"
-  if [ -f "${CERT_FILE}" ] && command -v cloudflared >/dev/null 2>&1; then
-    cloudflared tunnel list 2>/dev/null || log "⚠️  无法列出 tunnel（可能网络/权限问题）"
-  else
-    log "⚠️  未登录或未安装 cloudflared，跳过 tunnel list"
-  fi
-  log
-
-  log "[4] Ingress（从 config.yml 提取）"
-  HOST_IN_CFG=""
-  SVC_IN_CFG=""
-  if [ -f "${CONFIG_FILE}" ]; then
-    log "---- config.yml 摘要 ----"
-    sed -n '1,120p' "${CONFIG_FILE}" | sed -n '1,80p'
-    log "------------------------"
-    HOST_IN_CFG="$(awk '/hostname:/{print $2; exit}' "${CONFIG_FILE}" 2>/dev/null || true)"
-    SVC_IN_CFG="$(awk '/service:/{print $2; exit}' "${CONFIG_FILE}" 2>/dev/null || true)"
-    [ -n "${HOST_IN_CFG:-}" ] && log "解析到 hostname：${HOST_IN_CFG}"
-    [ -n "${SVC_IN_CFG:-}" ] && log "解析到 service ：${SVC_IN_CFG}"
-  else
-    log "⚠️  未找到 config.yml，无法解析 ingress"
-  fi
-  log
-
-  log "[5] 本地服务连通性（如果能解析到 service）"
-  if [ -n "${SVC_IN_CFG:-}" ] && echo "${SVC_IN_CFG}" | grep -qE '^http://'; then
-    PORT_IN_CFG="$(echo "${SVC_IN_CFG}" | sed -n 's#.*:\([0-9]\+\).*#\1#p')"
-    if [ -n "${PORT_IN_CFG:-}" ]; then
-      if ss -lntp 2>/dev/null | grep -q ":${PORT_IN_CFG} "; then
-        log "✅ 端口监听：${PORT_IN_CFG}"
-        ss -lntp | grep ":${PORT_IN_CFG} " || true
-      else
-        log "❌ 端口未监听：${PORT_IN_CFG}"
-      fi
-      curl -I --max-time 3 "${SVC_IN_CFG}" >/dev/null 2>&1 && log "✅ 本地 curl OK：${SVC_IN_CFG}" || log "❌ 本地 curl 失败：${SVC_IN_CFG}"
-    else
-      log "⚠️  无法从 service 解析端口：${SVC_IN_CFG}"
-    fi
-  else
-    log "⚠️  未解析到 service URL，跳过本地连通性检查"
-  fi
-  log
-
-  log "[6] 外网访问（如果能解析到 hostname）"
-  if [ -n "${HOST_IN_CFG:-}" ]; then
-    if command -v dig >/dev/null 2>&1; then
-      DNS_A="$(dig +short "${HOST_IN_CFG}" | head -n 1 || true)"
-      log "DNS 解析：${DNS_A:-<空>}"
-      echo "${DNS_A:-}" | grep -qi "cfargotunnel" && log "✅ DNS 指向 cfargotunnel（像是 tunnel）" || log "⚠️  DNS 看起来不像 cfargotunnel（不一定错，但建议检查）"
-    else
-      log "提示：未安装 dig，跳过 DNS 检查（可 sudo apt install dnsutils）"
-    fi
-
-    curl -I --max-time 6 "https://${HOST_IN_CFG}" >/dev/null 2>&1 \
-      && log "✅ HTTPS 访问 OK：https://${HOST_IN_CFG}" \
-      || log "❌ HTTPS 访问失败：https://${HOST_IN_CFG}（可能 DNS/证书/服务端口/应用问题）"
-  else
-    log "⚠️  未解析到 hostname，跳过外网访问检查"
-  fi
-
-  log "============================== Done =============================="
+  log "[2] 配置目录：${CLOUDFLARED_DIR}"
+  ls -l "${CLOUDFLARED_DIR}" 2>/dev/null || true
+  log "==============================================================="
   exit 0
 }
 
@@ -322,10 +289,14 @@ usage() {
   卸载：$0 --uninstall
   更新：$0 --update
 
-环境变量：
-  INSTALL_MODE=bin|deb        安装方式（默认 bin）
-  STRICT_PORT=1               端口未监听则退出（默认 0）
-  DENY_PUBLIC_PORT=1          尝试封死公网对端口访问（默认 0）
+环境变量（可选）：
+  INSTALL_MODE=bin|deb
+  STRICT_PORT=1
+  DENY_PUBLIC_PORT=1
+  RECREATE_ON_MISSING_CRED=0|1   (默认 1，缺 json 自动删 tunnel 并重建)
+  BACKEND_SCHEME=http|https      (默认 http；3x-ui 常用 https)
+  NO_TLS_VERIFY=0|1              (默认 0；3x-ui 自签证书建议 1)
+  PATH_REGEX='^/xxxx(/|$).*'     (需要子路径匹配时设置，例如 3x-ui webBasePath)
 EOF
 }
 
@@ -344,23 +315,21 @@ if [ $# -ge 1 ]; then
   esac
 fi
 
-if [ $# -lt 2 ]; then
-  usage
-  exit 1
-fi
+[ $# -ge 2 ] || { usage; exit 1; }
 
 PUBLIC_HOST="$1"
 LOCAL_PORT="$2"
 HOSTNAME_SYS="$(hostname)"
 TUNNEL_NAME="${3:-${HOSTNAME_SYS}-web}"
 LOCAL_HOST="127.0.0.1"
-SERVICE_URL="http://${LOCAL_HOST}:${LOCAL_PORT}"
+SERVICE_URL="${BACKEND_SCHEME}://${LOCAL_HOST}:${LOCAL_PORT}"
 
 log "==============================================="
 log " 域名            : ${PUBLIC_HOST}"
 log " 本地服务        : ${SERVICE_URL}"
 log " Tunnel 名称     : ${TUNNEL_NAME}"
 log " 安装模式        : ${INSTALL_MODE}"
+log " 子路径匹配      : ${PATH_REGEX:-<无>}"
 log "==============================================="
 log
 
@@ -377,7 +346,7 @@ else
   if [ "${STRICT_PORT}" -eq 1 ]; then
     die "STRICT_PORT=1：端口未监听，退出。请先启动你的服务。"
   fi
-  log "继续执行（但未来访问可能 502），建议先启动服务再跑。"
+  log "继续执行（未来可能 502），建议先启动服务再跑。"
 fi
 log
 
@@ -385,27 +354,43 @@ log "== [3/7] 检查 Cloudflare 授权（cert.pem） =="
 require_login_or_exit
 log
 
-log "== [4/7] 创建/复用 Tunnel =="
-ensure_tunnel "${TUNNEL_NAME}"
+log "== [4/7] 创建/复用 Tunnel 并确保凭据 json 存在 =="
+if tunnel_exists "${TUNNEL_NAME}"; then
+  log "Tunnel 已存在，复用：${TUNNEL_NAME}"
+else
+  cloudflared tunnel create "${TUNNEL_NAME}"
+fi
 
 TUNNEL_ID="$(get_tunnel_id "${TUNNEL_NAME}")"
-[ -n "${TUNNEL_ID}" ] || die "无法获取 Tunnel ID（cloudflared tunnel list 未找到 ${TUNNEL_NAME}）"
-log "Tunnel ID：${TUNNEL_ID}"
+[ -n "${TUNNEL_ID}" ] || die "无法获取 Tunnel ID（tunnel list 未找到 ${TUNNEL_NAME}）"
+CRED_FILE="${CLOUDFLARED_DIR}/${TUNNEL_ID}.json"
+
+# 关键：如果本机缺少 json，就无法运行。此时可选择自动删 tunnel 并重建。
+if [ ! -f "${CRED_FILE}" ]; then
+  log "⚠️  未发现 tunnel 凭据：${CRED_FILE}"
+  if [ "${RECREATE_ON_MISSING_CRED}" -eq 1 ]; then
+    log "将自动删除 Cloudflare 侧同名 tunnel 并重建（以重新生成 json）..."
+    cloudflared tunnel delete -f "${TUNNEL_NAME}" || true
+    cloudflared tunnel create "${TUNNEL_NAME}"
+
+    TUNNEL_ID="$(get_tunnel_id "${TUNNEL_NAME}")"
+    [ -n "${TUNNEL_ID}" ] || die "重建后仍无法获取 Tunnel ID"
+    CRED_FILE="${CLOUDFLARED_DIR}/${TUNNEL_ID}.json"
+  else
+    die "缺少 ${CRED_FILE}。请在 Zero Trust 后台下载 credentials(json) 放到该路径，或设 RECREATE_ON_MISSING_CRED=1 自动重建。"
+  fi
+fi
+
+[ -f "${CRED_FILE}" ] || die "仍未生成 credentials json：${CRED_FILE}"
+chmod 600 "${CRED_FILE}" || true
+log "✅ Tunnel：${TUNNEL_NAME}"
+log "✅ Tunnel ID：${TUNNEL_ID}"
+log "✅ 凭据文件：${CRED_FILE}"
 log
 
 log "== [5/7] 写 config.yml + 绑定 DNS =="
 mkdir -p "${CLOUDFLARED_DIR}"
-CRED_FILE="${CLOUDFLARED_DIR}/${TUNNEL_ID}.json"
-
-cat > "${CONFIG_FILE}" <<EOF
-tunnel: ${TUNNEL_ID}
-credentials-file: ${CRED_FILE}
-
-ingress:
-  - hostname: ${PUBLIC_HOST}
-    service: ${SERVICE_URL}
-  - service: http_status:404
-EOF
+write_config "${PUBLIC_HOST}" "${SERVICE_URL}" "${TUNNEL_ID}" "${CRED_FILE}"
 
 cloudflared tunnel route dns "${TUNNEL_NAME}" "${PUBLIC_HOST}"
 log "已写入：${CONFIG_FILE}"
@@ -423,5 +408,4 @@ log "=========================================="
 log "✅ 完成！访问： https://${PUBLIC_HOST}"
 log "状态： systemctl status ${SERVICE_NAME} --no-pager"
 log "日志： journalctl -u ${SERVICE_NAME} -f"
-log "提示：建议确保服务只监听 127.0.0.1，并封死公网端口，避免绕过。"
 log "=========================================="
